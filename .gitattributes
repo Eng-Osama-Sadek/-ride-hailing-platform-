@@ -1,0 +1,4 @@
+# يمنع تحويل نهايات الأسطر في سكربتات الشل (مهم على Windows حتى لا تفشل داخل Docker)
+*.sh text eol=lf
+*.yml text eol=lf
+*.sql text eol=lf

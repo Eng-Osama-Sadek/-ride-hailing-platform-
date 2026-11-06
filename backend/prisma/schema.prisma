@@ -1,0 +1,512 @@
+// =============================================================================
+// Ride-Hailing — Prisma schema (PostgreSQL)
+// Prisma 6.x  |  الأموال Decimal (جنيه مصري)  |  المعرّفات UUID
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ------------------------------------------------------------------ Enums ----
+
+enum Role {
+  RIDER
+  DRIVER
+  ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  PENDING_KYC // سواق سجّل ولم تُعتمد مستنداته بعد (يقدر يسجّل دخول ويرفع مستندات فقط)
+  SUSPENDED
+  BLOCKED
+}
+
+enum DocumentType {
+  DRIVING_LICENSE
+  CAR_LICENSE
+  NATIONAL_ID
+  CAR_FRONT
+  CAR_BACK
+  CAR_LEFT
+  CAR_RIGHT
+}
+
+enum DocumentStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum DriverLevel {
+  BRONZE
+  SILVER
+  GOLD
+}
+
+enum VehicleClass {
+  ECONOMY
+  COMFORT
+  VIP
+}
+
+enum RideStatus {
+  SEARCHING
+  ACCEPTED
+  ARRIVED // السواق وصل لنقطة الالتقاط
+  IN_PROGRESS // بدأت الرحلة بعد إدخال PIN
+  ARRIVED_AT_DESTINATION
+  COMPLETED
+  CANCELLED
+  NO_DRIVER_FOUND
+}
+
+enum PaymentMethod {
+  CASH
+  WALLET
+  CARD
+}
+
+enum TransactionType {
+  RIDE_PAYMENT
+  COMMISSION
+  CANCELLATION_FEE
+  TIP
+  WALLET_TOPUP
+  WITHDRAWAL
+  CASH_SETTLEMENT
+  REFUND
+}
+
+enum TransactionStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  REVERSED
+}
+
+enum WithdrawalMethod {
+  INSTAPAY
+  FAWRY
+}
+
+enum WithdrawalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  PAID
+}
+
+enum TicketStatus {
+  OPEN
+  IN_REVIEW
+  RESOLVED
+  CLOSED
+}
+
+enum NotificationType {
+  RIDE
+  PAYMENT
+  KYC
+  SOS
+  PROMO
+  SYSTEM
+}
+
+enum SosStatus {
+  OPEN
+  ACKNOWLEDGED
+  RESOLVED
+}
+
+enum DiscountType {
+  PERCENT
+  FIXED
+}
+
+// ------------------------------------------------------------ Users & Auth ----
+
+model User {
+  id           String     @id @default(uuid()) @db.Uuid
+  phone        String // E.164, مثال: +201000000001
+  name         String?
+  email        String?    @unique
+  passwordHash String? // للأدمن فقط (email + password)؛ الراكب/السواق يدخلان بـ OTP
+  role         Role
+  status       UserStatus @default(ACTIVE)
+  avatarUrl    String?
+  fcmToken     String?
+  lastLoginAt  DateTime?
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  riderProfile  RiderProfile?
+  driverProfile DriverProfile?
+  refreshTokens RefreshToken[]
+
+  ridesAsRider    Ride[]          @relation("RideRider")
+  ridesAsDriver   Ride[]          @relation("RideDriver")
+  transactions    Transaction[]
+  reviewsGiven    Review[]        @relation("ReviewFrom")
+  reviewsReceived Review[]        @relation("ReviewTo")
+  notifications   Notification[]
+  tickets         SupportTicket[]
+  auditLogs       AuditLog[]
+  sosEvents       SosEvent[]
+  chatMessages    ChatMessage[]
+
+  withdrawals          Withdrawal[]     @relation("WithdrawalDriver")
+  processedWithdrawals Withdrawal[]     @relation("WithdrawalProcessor")
+  verifiedDocuments    DriverDocument[] @relation("DocumentVerifier")
+
+  // نفس رقم الهاتف يمكن أن يكون راكباً وسواقاً (حسابان منفصلان بدور مختلف)
+  @@unique([phone, role])
+  @@index([role, status])
+  @@map("users")
+}
+
+model RefreshToken {
+  id           String    @id @default(uuid()) @db.Uuid
+  userId       String    @db.Uuid
+  tokenHash    String    @unique // SHA-256 للتوكن؛ التوكن الخام لا يُخزَّن أبداً
+  family       String    @db.Uuid // كل تدوير (rotation) يبقى في نفس العائلة لكشف إعادة الاستخدام
+  expiresAt    DateTime
+  revokedAt    DateTime?
+  replacedById String?   @db.Uuid
+  deviceId     String?
+  userAgent    String?
+  ip           String?
+  createdAt    DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([family])
+  @@map("refresh_tokens")
+}
+
+model RiderProfile {
+  userId                String        @id @db.Uuid
+  addresses             Json          @default("[]") // [{label, address, lat, lng}]
+  defaultPaymentMethod  PaymentMethod @default(CASH)
+  emergencyContactName  String?
+  emergencyContactPhone String?
+  walletBalance         Decimal       @default(0) @db.Decimal(12, 2)
+  rating                Float         @default(5)
+  totalRides            Int           @default(0)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("rider_profiles")
+}
+
+model DriverProfile {
+  userId             String         @id @db.Uuid
+  licenseNumber      String?
+  nationalIdEncrypted String? // مشفّر على مستوى التطبيق (AES-256-GCM)؛ لا يُخزَّن نصاً صريحاً
+  carModel           String?
+  carYear            Int?
+  carPlate           String?        @unique
+  carColor           String?
+  seats              Int            @default(4)
+  vehicleClass       VehicleClass   @default(ECONOMY)
+  documentsStatus    DocumentStatus @default(PENDING)
+  rating             Float          @default(5)
+  totalRides         Int            @default(0)
+  walletBalance      Decimal        @default(0) @db.Decimal(12, 2)
+  isOnline           Boolean        @default(false)
+  currentLat         Float?
+  currentLng         Float?
+  lastLocationAt     DateTime?
+  acceptanceRate     Float          @default(100)
+  level              DriverLevel    @default(BRONZE)
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
+
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  documents DriverDocument[]
+
+  @@index([isOnline, currentLat, currentLng])
+  @@map("driver_profiles")
+}
+
+model DriverDocument {
+  id              String         @id @default(uuid()) @db.Uuid
+  driverId        String         @db.Uuid
+  type            DocumentType
+  imageUrl        String // مفتاح الملف في التخزين (S3 key) وليس رابطاً عاماً
+  status          DocumentStatus @default(PENDING)
+  rejectionReason String?
+  verifiedById    String?        @db.Uuid
+  verifiedAt      DateTime?
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  driver     DriverProfile @relation(fields: [driverId], references: [userId], onDelete: Cascade)
+  verifiedBy User?         @relation("DocumentVerifier", fields: [verifiedById], references: [id], onDelete: SetNull)
+
+  // مستند واحد لكل نوع؛ إعادة الرفع بعد الرفض تحدّث نفس السجل (والتاريخ في AuditLog)
+  @@unique([driverId, type])
+  @@map("driver_documents")
+}
+
+// ------------------------------------------------------------------- Rides ----
+
+model Ride {
+  id            String        @id @default(uuid()) @db.Uuid
+  riderId       String        @db.Uuid
+  driverId      String?       @db.Uuid
+  vehicleClass  VehicleClass  @default(ECONOMY)
+  paymentMethod PaymentMethod @default(CASH)
+  status        RideStatus    @default(SEARCHING)
+
+  pickupLat      Float
+  pickupLng      Float
+  pickupAddress  String
+  dropoffLat     Float
+  dropoffLng     Float
+  dropoffAddress String
+  routePolyline  String?
+
+  distanceKm      Float?
+  durationMin     Float?
+  estimatedFare   Decimal  @db.Decimal(10, 2)
+  finalFare       Decimal? @db.Decimal(10, 2)
+  discountAmount  Decimal  @default(0) @db.Decimal(10, 2)
+  commission      Decimal? @db.Decimal(10, 2)
+  cancellationFee Decimal? @db.Decimal(10, 2)
+  tipAmount       Decimal  @default(0) @db.Decimal(10, 2)
+  couponId        String?  @db.Uuid
+
+  ridePin     String? @db.VarChar(4) // PIN من 4 أرقام يُولَّد عند القبول
+  pinAttempts Int     @default(0) // لمنع تخمين الـ PIN
+
+  cancelledBy        Role?
+  cancellationReason String?
+
+  createdAt   DateTime  @default(now())
+  acceptedAt  DateTime?
+  arrivedAt   DateTime?
+  startedAt   DateTime?
+  completedAt DateTime?
+  cancelledAt DateTime?
+  updatedAt   DateTime  @updatedAt
+
+  rider  User    @relation("RideRider", fields: [riderId], references: [id])
+  driver User?   @relation("RideDriver", fields: [driverId], references: [id])
+  coupon Coupon? @relation(fields: [couponId], references: [id], onDelete: SetNull)
+
+  statusHistory RideStatusHistory[]
+  transactions  Transaction[]
+  reviews       Review[]
+  tickets       SupportTicket[]
+  sosEvents     SosEvent[]
+  chatMessages  ChatMessage[]
+
+  @@index([status, createdAt])
+  @@index([riderId, createdAt])
+  @@index([driverId, createdAt])
+  @@map("rides")
+}
+
+model RideStatusHistory {
+  id          String     @id @default(uuid()) @db.Uuid
+  rideId      String     @db.Uuid
+  status      RideStatus
+  changedById String?    @db.Uuid
+  changedAt   DateTime   @default(now())
+
+  ride Ride @relation(fields: [rideId], references: [id], onDelete: Cascade)
+
+  @@index([rideId, changedAt])
+  @@map("ride_status_history")
+}
+
+model ChatMessage {
+  id       String    @id @default(uuid()) @db.Uuid
+  rideId   String    @db.Uuid
+  senderId String    @db.Uuid
+  body     String
+  sentAt   DateTime  @default(now())
+  readAt   DateTime?
+
+  ride   Ride @relation(fields: [rideId], references: [id], onDelete: Cascade)
+  sender User @relation(fields: [senderId], references: [id])
+
+  @@index([rideId, sentAt])
+  @@map("chat_messages")
+}
+
+model SosEvent {
+  id         String    @id @default(uuid()) @db.Uuid
+  rideId     String?   @db.Uuid
+  userId     String    @db.Uuid
+  lat        Float
+  lng        Float
+  status     SosStatus @default(OPEN)
+  notes      String?
+  createdAt  DateTime  @default(now())
+  resolvedAt DateTime?
+
+  ride Ride? @relation(fields: [rideId], references: [id], onDelete: SetNull)
+  user User  @relation(fields: [userId], references: [id])
+
+  @@index([status, createdAt])
+  @@map("sos_events")
+}
+
+// ------------------------------------------------------- Pricing & Coupons ----
+
+model PricingConfig {
+  id             String       @id @default(uuid()) @db.Uuid
+  vehicleClass   VehicleClass @unique
+  baseFare       Decimal      @db.Decimal(10, 2)
+  perKm          Decimal      @db.Decimal(10, 2)
+  perMinute      Decimal      @db.Decimal(10, 2)
+  minimumFare    Decimal      @db.Decimal(10, 2)
+  serviceFee     Decimal      @db.Decimal(10, 2)
+  commissionRate Decimal      @db.Decimal(5, 4) // 0.2000 = 20%
+  cancellationFee Decimal     @db.Decimal(10, 2)
+  isActive       Boolean      @default(true)
+  updatedAt      DateTime     @updatedAt
+
+  @@map("pricing_configs")
+}
+
+model Coupon {
+  id             String       @id @default(uuid()) @db.Uuid
+  code           String       @unique
+  description    String?
+  discountType   DiscountType
+  value          Decimal      @db.Decimal(10, 2)
+  maxDiscount    Decimal?     @db.Decimal(10, 2)
+  minFare        Decimal?     @db.Decimal(10, 2)
+  maxRedemptions Int?
+  redeemedCount  Int          @default(0)
+  perUserLimit   Int          @default(1)
+  validFrom      DateTime
+  validUntil     DateTime
+  isActive       Boolean      @default(true)
+  createdAt      DateTime     @default(now())
+
+  rides Ride[]
+
+  @@map("coupons")
+}
+
+// ------------------------------------------------------ Money & Feedback ----
+
+model Transaction {
+  id        String            @id @default(uuid()) @db.Uuid
+  userId    String            @db.Uuid
+  rideId    String?           @db.Uuid
+  type      TransactionType
+  amount    Decimal           @db.Decimal(12, 2) // موجب = دخل للمستخدم، سالب = خصم منه
+  method    PaymentMethod?
+  status    TransactionStatus @default(PENDING)
+  reference String?
+  note      String?
+  createdAt DateTime          @default(now())
+
+  user User  @relation(fields: [userId], references: [id])
+  ride Ride? @relation(fields: [rideId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([rideId])
+  @@map("transactions")
+}
+
+model Review {
+  id         String   @id @default(uuid()) @db.Uuid
+  rideId     String   @db.Uuid
+  fromUserId String   @db.Uuid
+  toUserId   String   @db.Uuid
+  rating     Int // 1..5 (يُتحقَّق منه في الـ DTO)
+  comment    String?
+  createdAt  DateTime @default(now())
+
+  ride Ride @relation(fields: [rideId], references: [id], onDelete: Cascade)
+  from User @relation("ReviewFrom", fields: [fromUserId], references: [id])
+  to   User @relation("ReviewTo", fields: [toUserId], references: [id])
+
+  @@unique([rideId, fromUserId])
+  @@index([toUserId, createdAt])
+  @@map("reviews")
+}
+
+model Withdrawal {
+  id            String           @id @default(uuid()) @db.Uuid
+  driverId      String           @db.Uuid
+  amount        Decimal          @db.Decimal(12, 2)
+  method        WithdrawalMethod
+  accountRef    String // رقم InstaPay/Fawry الذي سيُحوَّل إليه
+  status        WithdrawalStatus @default(PENDING)
+  note          String?
+  requestedAt   DateTime         @default(now())
+  processedAt   DateTime?
+  processedById String?          @db.Uuid
+
+  driver      User  @relation("WithdrawalDriver", fields: [driverId], references: [id])
+  processedBy User? @relation("WithdrawalProcessor", fields: [processedById], references: [id], onDelete: SetNull)
+
+  @@index([status, requestedAt])
+  @@map("withdrawals")
+}
+
+// ---------------------------------------------------- Support & Platform ----
+
+model Notification {
+  id        String           @id @default(uuid()) @db.Uuid
+  userId    String           @db.Uuid
+  title     String
+  body      String
+  type      NotificationType @default(SYSTEM)
+  data      Json?
+  isRead    Boolean          @default(false)
+  createdAt DateTime         @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, isRead, createdAt])
+  @@map("notifications")
+}
+
+model SupportTicket {
+  id          String       @id @default(uuid()) @db.Uuid
+  userId      String       @db.Uuid
+  rideId      String?      @db.Uuid
+  subject     String
+  description String?
+  status      TicketStatus @default(OPEN)
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  user User  @relation(fields: [userId], references: [id])
+  ride Ride? @relation(fields: [rideId], references: [id], onDelete: SetNull)
+
+  @@index([status, createdAt])
+  @@map("support_tickets")
+}
+
+model AuditLog {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String?  @db.Uuid
+  action    String // مثال: auth.login, ride.status_changed, withdrawal.approved
+  entity    String
+  entityId  String?
+  metadata  Json?
+  ip        String?
+  createdAt DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([entity, entityId])
+  @@index([userId, createdAt])
+  @@index([action, createdAt])
+  @@map("audit_logs")
+}

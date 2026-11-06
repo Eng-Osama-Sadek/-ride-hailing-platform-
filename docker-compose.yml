@@ -1,0 +1,151 @@
+# =============================================================================
+# Ride-Hailing — المرحلة 1: بيئة التطوير المحلية
+# التشغيل:   cp .env.example .env   ثم   docker compose up --build
+# الإيقاف:   docker compose down          (مع حذف البيانات: down -v)
+#
+# أمان الشبكة: كل الخدمات (قاعدة البيانات، Redis، التخزين، Adminer، Mailhog)
+# مربوطة على 127.0.0.1 فقط. الخدمة الوحيدة المفتوحة على الشبكة المحلية (LAN)
+# هي الـ Backend على المنفذ 3000 حتى يتصل بها الموبايل.
+# =============================================================================
+name: ride-hailing
+
+services:
+  # ---------------------------------------------------------------- PostgreSQL
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:?Set DB_USER in .env}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+      POSTGRES_DB: ${DB_NAME:?Set DB_NAME in .env}
+    ports:
+      - "127.0.0.1:${DB_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  # -------------------------------------------------------------------- Redis
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}"]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  # --------------------------------------------- Object Storage (S3-compatible)
+  # ملاحظة: MinIO أوقف نشر صور Docker المجانية (أكتوبر 2025) وأُرشف المشروع،
+  # لذلك نستخدم RustFS (متوافق مع S3 API على نفس المنفذ 9000).
+  # الكود يستخدم متغيرات S3_* العامة، فالانتقال لـ AWS S3 في الإنتاج = تغيير .env فقط.
+  storage:
+    image: rustfs/rustfs:latest
+    restart: unless-stopped
+    environment:
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY:?Set S3_ACCESS_KEY in .env}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_KEY:?Set S3_SECRET_KEY in .env}
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ADDRESS: ":9001"
+      RUSTFS_CONSOLE_ENABLE: "true"
+    ports:
+      - "127.0.0.1:9000:9000"   # S3 API
+      - "127.0.0.1:9001:9001"   # Web Console
+    volumes:
+      - storage_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:9000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  # ------------------------------------------------------------------ Backend
+  backend:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # القيم التالية تتغلب على .env (داخل شبكة Docker نستخدم أسماء الخدمات)
+      NODE_ENV: development
+      PORT: "3000"
+      DATABASE_URL: postgresql://${DB_USER}:${DB_PASSWORD}@postgres:5432/${DB_NAME}?schema=public
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      S3_ENDPOINT: http://storage:9000
+      SMTP_HOST: mailhog
+      SMTP_PORT: "1025"
+    ports:
+      - "3000:3000"             # مفتوح على الـ LAN ليتصل به الموبايل
+    volumes:
+      - ./backend:/app
+      - backend_node_modules:/app/node_modules
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3000/api/v1/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 90s
+
+  # --------------------------------------------------- Mailhog (اختبار الإيميلات)
+  # (المشروع غير نشط منذ فترة؛ بديل حديث: axllent/mailpit بنفس المنافذ)
+  mailhog:
+    image: mailhog/mailhog:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8025:8025"   # واجهة الويب
+      - "127.0.0.1:1025:1025"   # SMTP
+
+  # ------------------------------------------------ Adminer (تصفح PostgreSQL)
+  adminer:
+    image: adminer:latest
+    restart: unless-stopped
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ----------------------------------------------------- Admin Dashboard (لاحقاً)
+  # معطّل افتراضياً حتى نبنيه. لتشغيله لاحقاً:  docker compose --profile admin up
+  admin-dashboard:
+    profiles: ["admin"]
+    image: node:22-bookworm-slim
+    working_dir: /app
+    command: sh -c "npm install --no-audit --no-fund && npm run dev -- --host 0.0.0.0 --port 5173"
+    environment:
+      VITE_API_URL: http://localhost:3000/api/v1
+    ports:
+      - "127.0.0.1:5173:5173"
+    volumes:
+      - ./admin-dashboard:/app
+      - admin_node_modules:/app/node_modules
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
+  redisdata:
+  storage_data:
+  backend_node_modules:
+  admin_node_modules:

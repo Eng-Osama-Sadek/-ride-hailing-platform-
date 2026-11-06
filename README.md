@@ -20,6 +20,11 @@ A complete local-first ride-hailing platform for riders, drivers, and administra
 - **Security:** Role guards, default-deny authorization, throttling, audit logs, Helmet headers, and password hashing.
 - **Infrastructure:** Docker Compose services for PostgreSQL, Redis, S3-compatible storage, MailHog, Adminer, API, and dashboard.
 
+## Live deployment
+
+- **GitHub repository:** https://github.com/Eng-Osama-Sadek/-ride-hailing-platform-
+- **Admin dashboard:** https://ride-hailing-platform-mu.vercel.app
+
 ## Architecture
 
 ```text
